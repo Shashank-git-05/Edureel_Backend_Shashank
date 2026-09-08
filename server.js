@@ -13,6 +13,21 @@ const PORT = process.env.PORT || 3000;
 // -------------------------------------------------------------
 const isCloudDb = Boolean(process.env.DATABASE_URL && process.env.DATABASE_URL.trim() !== "");
 
+if (isCloudDb) {
+    try {
+        const parsedUrl = new URL(process.env.DATABASE_URL);
+        console.log(`DATABASE_URL present: true`);
+        console.log(`DB username: ${parsedUrl.username}`);
+        console.log(`DB host: ${parsedUrl.hostname}`);
+        console.log(`DB port: ${parsedUrl.port || 5432}`);
+        console.log(`DB name: ${parsedUrl.pathname.replace(/^\//, "")}`);
+    } catch (parseErr) {
+        console.log(`DATABASE_URL present: true (URL parse error)`);
+    }
+} else {
+    console.log(`DATABASE_URL present: false`);
+}
+
 const poolConfig = isCloudDb
     ? {
         connectionString: process.env.DATABASE_URL,
