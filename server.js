@@ -6,21 +6,43 @@ const multer = require("multer");
 const { Pool } = require("pg");
 
 const app = express();
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 
 // -------------------------------------------------------------
 // 1. Database Connection & Pooling Configuration
 // -------------------------------------------------------------
-const pool = new Pool({
-    user: process.env.DB_USER,
-    host: process.env.DB_HOST,
-    database: process.env.DB_NAME,
-    password: process.env.DB_PASSWORD,
-    port: process.env.DB_PORT,
+const isCloudDb = Boolean(process.env.DATABASE_URL && process.env.DATABASE_URL.trim() !== "");
+
+const poolConfig = isCloudDb
+    ? {
+        connectionString: process.env.DATABASE_URL,
+        ssl: { rejectUnauthorized: false },
+        max: 10, // Max clients in pool, optimal for Supabase Free tier
+        idleTimeoutMillis: 30000,
+        connectionTimeoutMillis: 5000,
+    }
+    : {
+        user: process.env.DB_USER,
+        host: process.env.DB_HOST,
+        database: process.env.DB_NAME,
+        password: process.env.DB_PASSWORD,
+        port: process.env.DB_PORT,
+        max: 10,
+        idleTimeoutMillis: 30000,
+        connectionTimeoutMillis: 5000,
+    };
+
+const pool = new Pool(poolConfig);
+
+pool.on("error", (err) => {
+    console.error("Unexpected database pool error ⚠️", err);
 });
 
 pool.connect()
-    .then(() => console.log("Connected to PostgreSQL ✅"))
+    .then(client => {
+        console.log(`Connected to PostgreSQL (${isCloudDb ? "Supabase Cloud ☁️" : "Local Database 💻"}) ✅`);
+        client.release();
+    })
     .catch(err => console.error("DB connection error ❌", err));
 
 // -------------------------------------------------------------
@@ -53,6 +75,117 @@ const upload = multer({ storage: storage });
 // Basic Server Health Route
 app.get("/", (req, res) => {
     res.send("Server is running 🚀");
+});
+
+// POST /api/notes/upload - Triggered by React UI to upload lecture notes into PostgreSQL 'notes' table
+app.post("/api/notes/upload", upload.single("file"), async (req, res) => {
+    try {
+        if (!req.file) {
+            return res.status(400).json({ error: "No file was found in the request!" });
+        }
+
+        const title = req.body.title || req.file.originalname;
+        const fileBuffer = req.file.buffer;
+
+        console.log("Uploading note into PG 'notes' table:", title);
+
+        // Inserting title and bytea file into 'notes' table
+        const result = await pool.query(
+            "INSERT INTO notes (title, file) VALUES ($1, $2) RETURNING id, title",
+            [title, fileBuffer]
+        );
+
+        const documentId = result.rows[0].id;
+
+        // --- RAG API Integration ---
+        // We check if the RAG_API_URL is set in the environment variables (e.g. his Ngrok URL)
+        const ragApiUrl = process.env.RAG_API_URL;
+        let ragStatus = "Not configured";
+
+        if (ragApiUrl) {
+            console.log(`Forwarding document ID ${documentId} to RAG API at ${ragApiUrl}...`);
+            try {
+                const formData = new FormData();
+
+                // Convert the buffer to a Blob for native fetch FormData
+                const fileBlob = new Blob([req.file.buffer], { type: req.file.mimetype });
+                formData.append("file", fileBlob, req.file.originalname);
+
+                formData.append("document_id", documentId.toString());
+
+                // If the frontend sends course_id and user_id, use them, otherwise use placeholders
+                formData.append("course_id", req.body.course_id || "default_course");
+                formData.append("user_id", req.body.user_id || "default_user");
+
+                const ragResponse = await fetch(`${ragApiUrl}/api/v1/documents/upload`, {
+                    method: "POST",
+                    body: formData
+                });
+
+                if (ragResponse.ok) {
+                    console.log("✅ Successfully forwarded to RAG API.");
+                    ragStatus = "Success";
+                } else {
+                    console.error("❌ RAG API responded with error:", ragResponse.status);
+                    ragStatus = "Failed API Response";
+                }
+            } catch (ragErr) {
+                console.error("❌ Error communicating with RAG API:", ragErr.message);
+                ragStatus = "Connection Error";
+            }
+        } else {
+            console.log("⚠️ RAG_API_URL not set in .env. Skipping RAG integration.");
+        }
+
+        res.status(200).json({
+            message: "Success! Note uploaded to PostgreSQL notes table.",
+            id: documentId,
+            title: result.rows[0].title ? result.rows[0].title.trim() : title,
+            filename: req.file.originalname,
+            size: req.file.size,
+            rag_status: ragStatus // Let the frontend know if RAG indexing succeeded
+        });
+    } catch (err) {
+        console.error("Notes upload route error:", err);
+        res.status(500).json({ error: "Server error occurred during note upload." });
+    }
+});
+
+// GET /api/notes - Fetch list of uploaded notes
+app.get("/api/notes", async (req, res) => {
+    try {
+        const result = await pool.query("SELECT id, title FROM notes ORDER BY id DESC");
+        const formattedNotes = result.rows.map(row => ({
+            id: row.id,
+            title: row.title ? row.title.trim() : `Note #${row.id}`
+        }));
+        res.json(formattedNotes);
+    } catch (err) {
+        console.error("Error fetching notes list:", err);
+        res.status(500).json({ error: "Server Error fetching notes list" });
+    }
+});
+
+// GET /api/notes/:id/file - Download or view note file
+app.get("/api/notes/:id/file", async (req, res) => {
+    try {
+        const { id } = req.params;
+        const result = await pool.query("SELECT title, file FROM notes WHERE id = $1", [id]);
+
+        if (result.rows.length === 0 || !result.rows[0].file) {
+            return res.status(404).send("Note file not found");
+        }
+
+        const note = result.rows[0];
+        const fileBuffer = note.file;
+
+        res.setHeader("Content-Disposition", `inline; filename="${note.title ? note.title.trim() : 'note'}"`);
+        res.setHeader("Content-Type", "application/octet-stream");
+        res.send(fileBuffer);
+    } catch (err) {
+        console.error("Error fetching note file:", err);
+        res.status(500).send("Server Error fetching note file");
+    }
 });
 
 // POST /api/upload - Triggered by the React UI to upload shorts into PG
@@ -89,13 +222,16 @@ app.get("/api/reels", async (req, res) => {
         // We grab the ID and titles but exclude the heavy file_data column to remain lightning fast
         const result = await pool.query("SELECT id, title, filename FROM reels ORDER BY id DESC");
 
-        // Map data rows to include an absolute streaming route pointing back to our server via ngrok
+        const protocol = req.headers["x-forwarded-proto"] || req.protocol;
+        const host = req.get("host");
+
+        // Map data rows to include an absolute streaming route pointing back to our server
         const reelsWithUrls = result.rows.map(reel => ({
             id: reel.id,
             title: reel.title,
             filename: reel.filename,
             // Dynamic stream pointer used directly by the Flutter player engine
-            videoUrl: `https://lisa-unevocable-undiscordantly.ngrok-free.dev/api/video/${reel.id}`
+            videoUrl: `${protocol}://${host}/api/video/${reel.id}`
         }));
 
         res.json(reelsWithUrls);
@@ -165,6 +301,6 @@ app.get("/api/video/:id", async (req, res) => {
 // -------------------------------------------------------------
 // 4. Initialization Port Listener
 // -------------------------------------------------------------
-app.listen(PORT, () => {
+app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on http://localhost:${PORT} 🚀`);
 });
