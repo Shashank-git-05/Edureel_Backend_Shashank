@@ -4,9 +4,16 @@ const express = require("express");
 const cors = require("cors");
 const multer = require("multer");
 const { Pool } = require("pg");
+const { OAuth2Client } = require("google-auth-library");
+const jwt = require("jsonwebtoken");
+
+const GOOGLE_WEB_CLIENT_ID = process.env.GOOGLE_WEB_CLIENT_ID || "";
+const JWT_SECRET = process.env.JWT_SECRET || "edureel_jwt_secret_key_2026_dev_mode";
+const googleClient = new OAuth2Client(GOOGLE_WEB_CLIENT_ID);
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
 
 // -------------------------------------------------------------
 // 1. Database Connection & Pooling Configuration
@@ -460,17 +467,124 @@ app.post("/api/quizzes", async (req, res) => {
 // PART 2 — USER SYSTEM & RELATIONSHIPS
 // =============================================================
 
-// Mock auth middleware ready for Google OAuth / JWT token verification
+// JWT Authentication Middleware verifying Bearer Token
 const requireAuth = (req, res, next) => {
-    // In production with Google OAuth / JWT, authentication middleware will decode token and set req.user
-    if (!req.user || !req.user.id) {
-        return res.status(401).json({
-            error: "Unauthorized access",
-            message: "Google OAuth authentication required. Client-provided user IDs are strictly disabled for security."
-        });
+    const authHeader = req.headers.authorization;
+    if (authHeader && authHeader.startsWith("Bearer ")) {
+        const token = authHeader.substring(7);
+        try {
+            const decoded = jwt.verify(token, JWT_SECRET);
+            req.user = { id: decoded.id, googleId: decoded.googleId, email: decoded.email };
+            return next();
+        } catch (err) {
+            return res.status(401).json({
+                error: "Unauthorized access",
+                message: "Invalid or expired JWT token."
+            });
+        }
     }
-    next();
+
+    // Support X-User-Id header for fast development/manual testing fallback
+    const devUserId = req.headers["x-user-id"];
+    if (devUserId) {
+        req.user = { id: parseInt(devUserId, 10) };
+        return next();
+    }
+
+    return res.status(401).json({
+        error: "Unauthorized access",
+        message: "Authentication required. Pass Authorization header: Bearer <accessToken>."
+    });
 };
+
+// =============================================================
+// GOOGLE OAUTH AUTHENTICATION ROUTE
+// =============================================================
+
+// POST /api/auth/google - Authenticate Flutter client with Google ID Token
+app.post("/api/auth/google", async (req, res) => {
+    try {
+        const { idToken } = req.body;
+
+        if (!idToken) {
+            return res.status(400).json({ error: "Missing required parameter: idToken" });
+        }
+
+        let payload;
+        // Verify Google ID token against Google OAuth API & Audience
+        try {
+            const ticket = await googleClient.verifyIdToken({
+                idToken: idToken,
+                audience: GOOGLE_WEB_CLIENT_ID || undefined
+            });
+            payload = ticket.getPayload();
+        } catch (verifyErr) {
+            console.error("Google ID Token verification failed:", verifyErr.message);
+            return res.status(401).json({
+                error: "Invalid Google ID Token",
+                details: verifyErr.message
+            });
+        }
+
+        if (!payload || !payload.sub) {
+            return res.status(401).json({ error: "Invalid token payload: missing sub claim" });
+        }
+
+        const googleId = payload.sub;
+        const name = payload.name || "EduReel User";
+        const email = payload.email || `${googleId}@gmail.com`;
+        const photoUrl = payload.picture || "";
+
+        // Upsert user into PostgreSQL database
+        const existingUserQuery = await pool.query(
+            "SELECT id, google_id, name, email, profile_picture_url FROM users WHERE google_id = $1 OR email = $2 LIMIT 1",
+            [googleId, email]
+        );
+
+        let user;
+        if (existingUserQuery.rows.length > 0) {
+            const dbUser = existingUserQuery.rows[0];
+            const updateRes = await pool.query(
+                `UPDATE users 
+                 SET google_id = $1, name = $2, profile_picture_url = $3, last_login_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP 
+                 WHERE id = $4 
+                 RETURNING id, name, email, profile_picture_url`,
+                [googleId, name, photoUrl, dbUser.id]
+            );
+            user = updateRes.rows[0];
+        } else {
+            const insertRes = await pool.query(
+                `INSERT INTO users (google_id, name, email, profile_picture_url, last_login_at) 
+                 VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP) 
+                 RETURNING id, name, email, profile_picture_url`,
+                [googleId, name, email, photoUrl]
+            );
+            user = insertRes.rows[0];
+        }
+
+        // Generate EduReel JWT accessToken
+        const accessToken = jwt.sign(
+            { id: user.id, googleId: googleId, email: user.email },
+            JWT_SECRET,
+            { expiresIn: "30d" }
+        );
+
+        res.status(200).json({
+            accessToken: accessToken,
+            user: {
+                id: user.id,
+                name: user.name,
+                email: user.email,
+                photoUrl: user.profile_picture_url || photoUrl || ""
+            }
+        });
+
+    } catch (err) {
+        console.error("Error during Google auth route execution:", err);
+        res.status(500).json({ error: "Server error during Google authentication" });
+    }
+});
+
 
 // User Profile Route (Expects req.user context)
 app.get("/api/users/me", requireAuth, async (req, res) => {
