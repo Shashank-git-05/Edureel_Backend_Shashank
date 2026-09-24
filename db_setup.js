@@ -34,6 +34,11 @@ async function run() {
         await pool.query("ALTER TABLE reels ADD COLUMN IF NOT EXISTS file_data BYTEA");
         await pool.query("ALTER TABLE reels ADD COLUMN IF NOT EXISTS filename TEXT");
 
+        // Ensure user profile columns exist
+        await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS phone VARCHAR(50)");
+        await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS institution VARCHAR(255)");
+        await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS skills JSONB DEFAULT '[]'::jsonb");
+
         // 1. Users Table
         await pool.query(`
             CREATE TABLE IF NOT EXISTS users (
@@ -42,11 +47,15 @@ async function run() {
                 name VARCHAR(255) NOT NULL,
                 email VARCHAR(255) UNIQUE NOT NULL,
                 profile_picture_url TEXT,
+                phone VARCHAR(50),
+                institution VARCHAR(255),
+                skills JSONB DEFAULT '[]'::jsonb,
                 created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
                 last_login_at TIMESTAMP WITH TIME ZONE
             );
         `);
+
 
         // 2. Quizzes Table
         await pool.query(`

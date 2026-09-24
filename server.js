@@ -590,7 +590,7 @@ app.post("/api/auth/google", async (req, res) => {
 app.get("/api/users/me", requireAuth, async (req, res) => {
     try {
         const userId = req.user.id;
-        const result = await pool.query("SELECT id, google_id, name, email, profile_picture_url, created_at FROM users WHERE id = $1", [userId]);
+        const result = await pool.query("SELECT id, google_id, name, email, profile_picture_url, phone, institution, skills, created_at FROM users WHERE id = $1", [userId]);
         if (result.rows.length === 0) {
             return res.status(404).json({ error: "User profile not found" });
         }
@@ -600,6 +600,144 @@ app.get("/api/users/me", requireAuth, async (req, res) => {
         res.status(500).json({ error: "Server error fetching user profile" });
     }
 });
+
+// GET /api/users/me/profile - Fetch structured user profile for Flutter app
+app.get("/api/users/me/profile", requireAuth, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const result = await pool.query(
+            "SELECT id, name, phone, email, institution, skills FROM users WHERE id = $1",
+            [userId]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: "User profile not found" });
+        }
+
+        const user = result.rows[0];
+        let skillsArray = [];
+        if (Array.isArray(user.skills)) {
+            skillsArray = user.skills;
+        } else if (typeof user.skills === "string") {
+            try {
+                skillsArray = JSON.parse(user.skills);
+            } catch (e) {
+                skillsArray = [];
+            }
+        }
+
+        res.status(200).json({
+            profile: {
+                id: user.id,
+                name: user.name || "",
+                phone: user.phone || null,
+                email: user.email || "",
+                institution: user.institution || null,
+                skills: skillsArray
+            }
+        });
+    } catch (err) {
+        console.error("Error fetching user profile:", err);
+        res.status(500).json({ error: "Server error fetching user profile" });
+    }
+});
+
+// PUT /api/users/me/profile - Update authenticated user profile
+app.put("/api/users/me/profile", requireAuth, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        let { name, phone, email, institution, skills } = req.body;
+
+        // Validations
+        if (!name || typeof name !== "string" || name.trim() === "") {
+            return res.status(400).json({ error: "Validation error: 'name' is required and cannot be empty." });
+        }
+        name = name.trim();
+
+        if (!email || typeof email !== "string" || email.trim() === "") {
+            return res.status(400).json({ error: "Validation error: 'email' is required and cannot be empty." });
+        }
+        email = email.trim();
+        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+        if (!emailRegex.test(email)) {
+            return res.status(400).json({ error: "Validation error: 'email' must be a valid email address." });
+        }
+
+        if (phone !== undefined && phone !== null) {
+            if (typeof phone !== "string") {
+                return res.status(400).json({ error: "Validation error: 'phone' must be a string or null." });
+            }
+            phone = phone.trim() === "" ? null : phone.trim();
+        } else {
+            phone = null;
+        }
+
+        if (institution !== undefined && institution !== null) {
+            if (typeof institution !== "string") {
+                return res.status(400).json({ error: "Validation error: 'institution' must be a string or null." });
+            }
+            institution = institution.trim() === "" ? null : institution.trim();
+        } else {
+            institution = null;
+        }
+
+        if (skills !== undefined && skills !== null) {
+            if (!Array.isArray(skills)) {
+                return res.status(400).json({ error: "Validation error: 'skills' must be an array of strings." });
+            }
+            for (let i = 0; i < skills.length; i++) {
+                if (typeof skills[i] !== "string") {
+                    return res.status(400).json({ error: `Validation error: skills[${i}] must be a string.` });
+                }
+                skills[i] = skills[i].trim();
+            }
+        } else {
+            skills = [];
+        }
+
+        const result = await pool.query(
+            `UPDATE users 
+             SET name = $1, email = $2, phone = $3, institution = $4, skills = $5::jsonb, updated_at = CURRENT_TIMESTAMP 
+             WHERE id = $6 
+             RETURNING id, name, phone, email, institution, skills`,
+            [name, email, phone, institution, JSON.stringify(skills), userId]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: "User profile not found" });
+        }
+
+        const updatedUser = result.rows[0];
+        let skillsArray = [];
+        if (Array.isArray(updatedUser.skills)) {
+            skillsArray = updatedUser.skills;
+        } else if (typeof updatedUser.skills === "string") {
+            try {
+                skillsArray = JSON.parse(updatedUser.skills);
+            } catch (e) {
+                skillsArray = [];
+            }
+        }
+
+        res.status(200).json({
+            profile: {
+                id: updatedUser.id,
+                name: updatedUser.name,
+                phone: updatedUser.phone || null,
+                email: updatedUser.email,
+                institution: updatedUser.institution || null,
+                skills: skillsArray
+            }
+        });
+    } catch (err) {
+        if (err.code === '23505') { // Unique constraint violation (email)
+            return res.status(400).json({ error: "Validation error: email address is already in use by another account." });
+        }
+        console.error("Error updating user profile:", err);
+        res.status(500).json({ error: "Server error updating user profile" });
+    }
+});
+
 
 // GET Liked Reels (Expects req.user context)
 app.get("/api/users/me/liked-reels", requireAuth, async (req, res) => {
