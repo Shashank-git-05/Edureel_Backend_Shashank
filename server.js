@@ -221,10 +221,12 @@ app.post("/api/upload", upload.single("file"), async (req, res) => {
 
         console.log("Success! Backend received file in memory:", req.file.originalname);
         const fileBuffer = req.file.buffer;
+        const category = req.body.category || "General";
+        const durationSeconds = parseFloat(req.body.duration_seconds || req.body.durationSeconds || 0);
 
         const result = await pool.query(
-            "INSERT INTO reels (title, filename, file_data) VALUES ($1, $2, $3) RETURNING id, title, filename",
-            [req.file.originalname, req.file.originalname, fileBuffer]
+            "INSERT INTO reels (title, filename, file_data, category, duration_seconds) VALUES ($1, $2, $3, $4, $5) RETURNING id, title, filename, category, duration_seconds",
+            [req.file.originalname, req.file.originalname, fileBuffer, category, durationSeconds]
         );
 
         res.status(200).json({
@@ -242,7 +244,7 @@ app.post("/api/upload", upload.single("file"), async (req, res) => {
 // GET /api/reels - Triggered by Flutter to fetch the listing meta-data
 app.get("/api/reels", async (req, res) => {
     try {
-        const result = await pool.query("SELECT id, title, filename FROM reels ORDER BY id DESC");
+        const result = await pool.query("SELECT id, title, filename, category, duration_seconds FROM reels ORDER BY id DESC");
 
         const protocol = req.headers["x-forwarded-proto"] || req.protocol;
         const host = req.get("host");
@@ -251,6 +253,8 @@ app.get("/api/reels", async (req, res) => {
             id: reel.id,
             title: reel.title,
             filename: reel.filename,
+            category: reel.category || "General",
+            durationSeconds: parseFloat(reel.duration_seconds || 0),
             videoUrl: `${protocol}://${host}/api/video/${reel.id}`
         }));
 
@@ -836,6 +840,545 @@ app.delete("/api/reels/:id/save", requireAuth, async (req, res) => {
     } catch (err) {
         console.error("Error unsaving reel:", err);
         res.status(500).json({ error: "Server error unsaving reel" });
+    }
+});
+
+// =============================================================
+// USER QUIZ ATTEMPTS & SCORE HISTORY ENDPOINTS
+// =============================================================
+
+// POST /api/quizzes/:id/submit - Submit quiz attempt & compute score atomically
+app.post("/api/quizzes/:id/submit", requireAuth, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const quizId = parseInt(req.params.id, 10);
+        const userId = req.user.id;
+        let rawAnswers = req.body.answers || req.body;
+
+        console.log(`[Quiz Submit] User ${userId} submitting for Quiz ${quizId}. Payload:`, JSON.stringify(req.body));
+
+        // Convert answers object { "qId": optId } into array if needed
+        let answersArray = [];
+        if (Array.isArray(rawAnswers)) {
+            answersArray = rawAnswers;
+        } else if (rawAnswers && typeof rawAnswers === "object") {
+            answersArray = Object.entries(rawAnswers).map(([k, v]) => ({
+                questionId: k,
+                selectedOptionId: v
+            }));
+        }
+
+        if (!answersArray || answersArray.length === 0) {
+            return res.status(400).json({ error: "Invalid payload. Non-empty answers array or map is required." });
+        }
+
+        // Verify quiz exists
+        const quizRes = await client.query("SELECT id, title FROM quizzes WHERE id = $1", [quizId]);
+        if (quizRes.rows.length === 0) {
+            return res.status(404).json({ error: `Quiz with id ${quizId} not found.` });
+        }
+
+        // Fetch all questions and options for this quiz
+        const questionsRes = await client.query(
+            "SELECT id, question_order FROM quiz_questions WHERE quiz_id = $1 ORDER BY question_order ASC, id ASC",
+            [quizId]
+        );
+        const totalQuestions = questionsRes.rows.length;
+
+        if (totalQuestions === 0) {
+            return res.status(400).json({ error: "Quiz has no questions to evaluate." });
+        }
+
+        // Fetch all options per question for this quiz
+        const optionsRes = await client.query(
+            `SELECT id, question_id, option_text, is_correct 
+             FROM quiz_options 
+             WHERE question_id IN (SELECT id FROM quiz_questions WHERE quiz_id = $1)
+             ORDER BY id ASC`,
+            [quizId]
+        );
+
+        // Map options by question_id: qId -> Array of options
+        const questionOptionsMap = {};
+        const correctOptionsMap = {};
+
+        optionsRes.rows.forEach(opt => {
+            const qId = opt.question_id;
+            if (!questionOptionsMap[qId]) questionOptionsMap[qId] = [];
+            questionOptionsMap[qId].push(opt);
+            if (opt.is_correct) {
+                correctOptionsMap[qId] = opt.id;
+            }
+        });
+
+        // Compute score & build results array
+        let score = 0;
+        const results = [];
+        const answerSubmissions = [];
+
+        answersArray.forEach(ans => {
+            const qId = parseInt(ans.questionId || ans.question_id || ans.questionIdStr || ans.id, 10);
+            let rawOpt = (ans.selectedOptionId !== undefined && ans.selectedOptionId !== null)
+                ? ans.selectedOptionId
+                : (ans.selected_option_id !== undefined && ans.selected_option_id !== null)
+                    ? ans.selected_option_id
+                    : (ans.optionId !== undefined && ans.optionId !== null)
+                        ? ans.optionId
+                        : (ans.option_id !== undefined && ans.option_id !== null)
+                            ? ans.option_id
+                            : ans.selectedOption || ans.selected_option || null;
+
+            let selectedOptId = rawOpt !== null ? parseInt(rawOpt, 10) : null;
+            const qOptions = questionOptionsMap[qId] || [];
+            const correctOptId = correctOptionsMap[qId] || null;
+
+            // Check if selectedOptId directly matches an option ID
+            let matchedOption = qOptions.find(o => o.id === selectedOptId);
+
+            // Fallback: If selectedOptId did not match any option ID, check if Flutter sent 0-based option index (0, 1, 2, 3)
+            if (!matchedOption && selectedOptId !== null && selectedOptId >= 0 && selectedOptId < qOptions.length) {
+                matchedOption = qOptions[selectedOptId];
+                if (matchedOption) {
+                    selectedOptId = matchedOption.id;
+                }
+            }
+
+            const isCorrect = (matchedOption && matchedOption.id === correctOptId);
+
+            if (isCorrect) score++;
+
+            results.push({
+                questionId: qId,
+                selectedOptionId: selectedOptId,
+                correctOptionId: correctOptId,
+                isCorrect: isCorrect
+            });
+
+            answerSubmissions.push({
+                questionId: qId,
+                selectedOptionId: selectedOptId,
+                isCorrect: isCorrect
+            });
+        });
+
+        const percentage = parseFloat(((score / totalQuestions) * 100).toFixed(2));
+
+        console.log(`[Quiz Submit Result] Quiz ${quizId}, User ${userId} -> Score: ${score}/${totalQuestions} (${percentage}%)`);
+
+        await client.query("BEGIN");
+
+        // Insert overall attempt
+        const attemptRes = await client.query(
+            `INSERT INTO user_quiz_attempts (user_id, quiz_id, score, total_questions, percentage)
+             VALUES ($1, $2, $3, $4, $5)
+             RETURNING id, completed_at`,
+            [userId, quizId, score, totalQuestions, percentage]
+        );
+        const attemptId = attemptRes.rows[0].id;
+
+        // Insert individual question answers
+        for (const item of answerSubmissions) {
+            await client.query(
+                `INSERT INTO user_quiz_answers (attempt_id, question_id, selected_option_id, is_correct)
+                 VALUES ($1, $2, $3, $4)`,
+                [attemptId, item.questionId, item.selectedOptionId, item.isCorrect]
+            );
+        }
+
+        await client.query("COMMIT");
+
+        res.status(201).json({
+            message: "Quiz attempt submitted successfully",
+            attemptId: attemptId,
+            quizId: quizId,
+            score: score,
+            totalQuestions: totalQuestions,
+            percentage: percentage,
+            completedAt: attemptRes.rows[0].completed_at,
+            results: results
+        });
+    } catch (err) {
+        await client.query("ROLLBACK");
+        console.error("Error submitting quiz attempt:", err);
+        res.status(500).json({ error: "Server error submitting quiz attempt" });
+    } finally {
+        client.release();
+    }
+});
+
+// GET /api/users/me/quiz-attempts - Retrieve past quiz attempts for logged-in user
+app.get("/api/users/me/quiz-attempts", requireAuth, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const result = await pool.query(
+            `SELECT uqa.id AS "attemptId", 
+                    uqa.quiz_id AS "quizId", 
+                    q.title AS "quizTitle", 
+                    q.reel_id AS "reelId", 
+                    uqa.score, 
+                    uqa.total_questions AS "totalQuestions", 
+                    uqa.percentage, 
+                    uqa.completed_at AS "completedAt"
+             FROM user_quiz_attempts uqa
+             JOIN quizzes q ON uqa.quiz_id = q.id
+             WHERE uqa.user_id = $1
+             ORDER BY uqa.completed_at DESC`,
+            [userId]
+        );
+        res.json(result.rows);
+    } catch (err) {
+        console.error("Error fetching user quiz attempts:", err);
+        res.status(500).json({ error: "Server error fetching quiz attempts" });
+    }
+});
+
+// GET /api/users/me/quiz-attempts/:attemptId - Detailed breakdown of a specific attempt
+app.get("/api/users/me/quiz-attempts/:attemptId", requireAuth, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const attemptId = parseInt(req.params.attemptId, 10);
+
+        // Fetch attempt metadata
+        const attemptRes = await pool.query(
+            `SELECT uqa.id AS "attemptId", 
+                    uqa.quiz_id AS "quizId", 
+                    q.title AS "quizTitle", 
+                    q.description AS "quizDescription", 
+                    q.reel_id AS "reelId", 
+                    uqa.score, 
+                    uqa.total_questions AS "totalQuestions", 
+                    uqa.percentage, 
+                    uqa.completed_at AS "completedAt"
+             FROM user_quiz_attempts uqa
+             JOIN quizzes q ON uqa.quiz_id = q.id
+             WHERE uqa.id = $1 AND uqa.user_id = $2`,
+            [attemptId, userId]
+        );
+
+        if (attemptRes.rows.length === 0) {
+            return res.status(404).json({ error: "Quiz attempt not found." });
+        }
+
+        const attempt = attemptRes.rows[0];
+
+        // Fetch question choices & options breakdown
+        const answersRes = await pool.query(
+            `SELECT uqa.question_id AS "questionId",
+                    qq.question AS "questionText",
+                    uqa.selected_option_id AS "selectedOptionId",
+                    sel_opt.option_text AS "selectedOptionText",
+                    corr_opt.id AS "correctOptionId",
+                    corr_opt.option_text AS "correctOptionText",
+                    uqa.is_correct AS "isCorrect"
+             FROM user_quiz_answers uqa
+             JOIN quiz_questions qq ON uqa.question_id = qq.id
+             LEFT JOIN quiz_options sel_opt ON uqa.selected_option_id = sel_opt.id
+             LEFT JOIN quiz_options corr_opt ON corr_opt.question_id = qq.id AND corr_opt.is_correct = TRUE
+             WHERE uqa.attempt_id = $1
+             ORDER BY qq.question_order ASC, qq.id ASC`,
+            [attemptId]
+        );
+
+        attempt.answers = answersRes.rows;
+        res.json(attempt);
+    } catch (err) {
+        console.error("Error fetching quiz attempt detail:", err);
+        res.status(500).json({ error: "Server error fetching quiz attempt detail" });
+    }
+});
+
+// =============================================================
+// AI DOCUMENT & REEL SUMMARIES ENDPOINTS
+// =============================================================
+
+const saveSummaryHandler = async (req, res) => {
+    try {
+        const {
+            reel_id, reelId,
+            note_id, noteId,
+            title,
+            summary,
+            bullets,
+            source_chunks, sourceChunks
+        } = req.body;
+
+        const targetReelId = reel_id || reelId || null;
+        const targetNoteId = note_id || noteId || null;
+        const summaryTitle = title || "AI Document Summary";
+        const summaryText = summary || "";
+
+        const bulletsJson = JSON.stringify(bullets || []);
+        const sourceChunksJson = JSON.stringify(source_chunks || sourceChunks || []);
+
+        const result = await pool.query(
+            `INSERT INTO summaries (reel_id, note_id, title, summary, bullets, source_chunks)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             RETURNING id, reel_id AS "reelId", note_id AS "noteId", title, summary, bullets, source_chunks AS "sourceChunks", created_at AS "createdAt"`,
+            [targetReelId, targetNoteId, summaryTitle, summaryText, bulletsJson, sourceChunksJson]
+        );
+
+        const saved = result.rows[0];
+
+        res.status(201).json({
+            message: "Summary saved successfully",
+            summaryId: saved.id,
+            summary: saved
+        });
+    } catch (err) {
+        console.error("Error saving summary:", err);
+        res.status(500).json({ error: "Server error saving summary" });
+    }
+};
+
+// POST /api/summaries and POST /api/summary (React Summarizer frontend integration)
+app.post("/api/summaries", saveSummaryHandler);
+app.post("/api/summary", saveSummaryHandler);
+
+// GET /api/summaries - Fetch all saved summaries
+app.get("/api/summaries", async (req, res) => {
+    try {
+        const result = await pool.query(
+            `SELECT id, 
+                    reel_id AS "reelId", 
+                    note_id AS "noteId", 
+                    title, 
+                    summary, 
+                    bullets, 
+                    source_chunks AS "sourceChunks", 
+                    created_at AS "createdAt" 
+             FROM summaries 
+             ORDER BY id DESC`
+        );
+        res.json(result.rows);
+    } catch (err) {
+        console.error("Error fetching summaries:", err);
+        res.status(500).json({ error: "Server error fetching summaries" });
+    }
+});
+
+// GET /api/summaries/:id - Fetch summary by ID
+app.get("/api/summaries/:id", async (req, res) => {
+    try {
+        const { id } = req.params;
+        const result = await pool.query(
+            `SELECT id, 
+                    reel_id AS "reelId", 
+                    note_id AS "noteId", 
+                    title, 
+                    summary, 
+                    bullets, 
+                    source_chunks AS "sourceChunks", 
+                    created_at AS "createdAt" 
+             FROM summaries 
+             WHERE id = $1`,
+            [id]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: "Summary not found" });
+        }
+
+        res.json(result.rows[0]);
+    } catch (err) {
+        console.error("Error fetching summary detail:", err);
+        res.status(500).json({ error: "Server error fetching summary detail" });
+    }
+});
+
+// GET /api/notes/:id/summary - Fetch summary for a specific note
+app.get("/api/notes/:id/summary", async (req, res) => {
+    try {
+        const noteId = req.params.id;
+        const result = await pool.query(
+            `SELECT id, 
+                    reel_id AS "reelId", 
+                    note_id AS "noteId", 
+                    title, 
+                    summary, 
+                    bullets, 
+                    source_chunks AS "sourceChunks", 
+                    created_at AS "createdAt" 
+             FROM summaries 
+             WHERE note_id = $1 
+             ORDER BY id DESC LIMIT 1`,
+            [noteId]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: "No summary found for this note" });
+        }
+
+        res.json(result.rows[0]);
+    } catch (err) {
+        console.error("Error fetching note summary:", err);
+        res.status(500).json({ error: "Server error fetching note summary" });
+    }
+});
+
+// =============================================================
+// REEL WATCH TIME & CATEGORY METRICS ENDPOINTS
+// =============================================================
+
+// POST /api/reels/:id/watch - Record/Update user watch time & view count for a reel
+app.post("/api/reels/:id/watch", requireAuth, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const reelId = parseInt(req.params.id, 10);
+        const watchTimeSeconds = parseFloat(req.body.watchTimeSeconds || req.body.watch_time_seconds || 0);
+        const totalDurationSeconds = parseFloat(req.body.totalDurationSeconds || req.body.total_duration_seconds || 0);
+        const isCompleted = Boolean(req.body.completed);
+
+        // Fetch reel to verify existence and fallback total_duration if not supplied
+        const reelRes = await pool.query("SELECT id, duration_seconds FROM reels WHERE id = $1", [reelId]);
+        if (reelRes.rows.length === 0) {
+            return res.status(404).json({ error: `Reel with id ${reelId} not found.` });
+        }
+
+        const actualDuration = totalDurationSeconds > 0 ? totalDurationSeconds : parseFloat(reelRes.rows[0].duration_seconds || 0);
+        const completionRate = actualDuration > 0 ? Math.min(100.0, parseFloat(((watchTimeSeconds / actualDuration) * 100).toFixed(2))) : 0;
+        const markCompleted = isCompleted || completionRate >= 90.0;
+
+        // UPSERT into user_reel_metrics
+        const result = await pool.query(
+            `INSERT INTO user_reel_metrics (user_id, reel_id, watch_count, watch_time_seconds, total_duration_seconds, completion_rate, completed, last_watched_at)
+             VALUES ($1, $2, 1, $3, $4, $5, $6, CURRENT_TIMESTAMP)
+             ON CONFLICT (user_id, reel_id) DO UPDATE SET
+                watch_count = user_reel_metrics.watch_count + 1,
+                watch_time_seconds = GREATEST(user_reel_metrics.watch_time_seconds, EXCLUDED.watch_time_seconds),
+                total_duration_seconds = GREATEST(user_reel_metrics.total_duration_seconds, EXCLUDED.total_duration_seconds),
+                completion_rate = GREATEST(user_reel_metrics.completion_rate, EXCLUDED.completion_rate),
+                completed = user_reel_metrics.completed OR EXCLUDED.completed,
+                last_watched_at = CURRENT_TIMESTAMP
+             RETURNING id, user_id AS "userId", reel_id AS "reelId", watch_count AS "watchCount", 
+                       watch_time_seconds AS "watchTimeSeconds", total_duration_seconds AS "totalDurationSeconds",
+                       completion_rate AS "completionRate", completed, last_watched_at AS "lastWatchedAt"`,
+            [userId, reelId, watchTimeSeconds, actualDuration, completionRate, markCompleted]
+        );
+
+        res.status(200).json({
+            message: "Watch metric recorded successfully",
+            metric: result.rows[0]
+        });
+    } catch (err) {
+        console.error("Error recording watch metric:", err);
+        res.status(500).json({ error: "Server error recording watch metric" });
+    }
+});
+
+// GET /api/users/me/watch-metrics - Get student watch time metrics, category breakdown, & history
+app.get("/api/users/me/watch-metrics", requireAuth, async (req, res) => {
+    try {
+        const userId = req.user.id;
+
+        // Aggregate overall watch time and reels watched count
+        const summaryRes = await pool.query(
+            `SELECT COALESCE(SUM(watch_time_seconds), 0) AS "totalWatchTimeSeconds",
+                    COUNT(DISTINCT reel_id) AS "totalReelsWatched",
+                    COALESCE(SUM(watch_count), 0) AS "totalViewEvents"
+             FROM user_reel_metrics
+             WHERE user_id = $1`,
+            [userId]
+        );
+
+        // Category breakdown
+        const categoryRes = await pool.query(
+            `SELECT COALESCE(r.category, 'General') AS category,
+                    COUNT(DISTINCT urm.reel_id) AS "reelsWatched",
+                    COALESCE(SUM(urm.watch_time_seconds), 0) AS "totalWatchTimeSeconds",
+                    COALESCE(SUM(urm.watch_count), 0) AS "totalViews"
+             FROM user_reel_metrics urm
+             JOIN reels r ON urm.reel_id = r.id
+             WHERE urm.user_id = $1
+             GROUP BY COALESCE(r.category, 'General')
+             ORDER BY "totalWatchTimeSeconds" DESC`,
+            [userId]
+        );
+
+        // Recent watch history list per reel
+        const historyRes = await pool.query(
+            `SELECT urm.reel_id AS "reelId",
+                    r.title AS "reelTitle",
+                    COALESCE(r.category, 'General') AS category,
+                    urm.watch_count AS "watchCount",
+                    urm.watch_time_seconds AS "watchTimeSeconds",
+                    urm.total_duration_seconds AS "totalDurationSeconds",
+                    urm.completion_rate AS "completionRate",
+                    urm.completed,
+                    urm.last_watched_at AS "lastWatchedAt"
+             FROM user_reel_metrics urm
+             JOIN reels r ON urm.reel_id = r.id
+             WHERE urm.user_id = $1
+             ORDER BY urm.last_watched_at DESC`,
+            [userId]
+        );
+
+        res.json({
+            totalWatchTimeSeconds: parseFloat(summaryRes.rows[0].totalWatchTimeSeconds),
+            totalReelsWatched: parseInt(summaryRes.rows[0].totalReelsWatched, 10),
+            totalViewEvents: parseInt(summaryRes.rows[0].totalViewEvents, 10),
+            categoryBreakdown: categoryRes.rows.map(c => ({
+                category: c.category,
+                reelsWatched: parseInt(c.reelsWatched, 10),
+                totalWatchTimeSeconds: parseFloat(c.totalWatchTimeSeconds),
+                totalViews: parseInt(c.totalViews, 10)
+            })),
+            recentWatchHistory: historyRes.rows.map(h => ({
+                ...h,
+                watchTimeSeconds: parseFloat(h.watchTimeSeconds),
+                totalDurationSeconds: parseFloat(h.totalDurationSeconds),
+                completionRate: parseFloat(h.completionRate)
+            }))
+        });
+    } catch (err) {
+        console.error("Error fetching watch metrics:", err);
+        res.status(500).json({ error: "Server error fetching watch metrics" });
+    }
+});
+
+// GET /api/users/me/reels/:id/watch-metric - Specific reel watch metric
+app.get("/api/users/me/reels/:id/watch-metric", requireAuth, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const reelId = parseInt(req.params.id, 10);
+
+        const result = await pool.query(
+            `SELECT urm.reel_id AS "reelId",
+                    r.title AS "reelTitle",
+                    COALESCE(r.category, 'General') AS category,
+                    urm.watch_count AS "watchCount",
+                    urm.watch_time_seconds AS "watchTimeSeconds",
+                    urm.total_duration_seconds AS "totalDurationSeconds",
+                    urm.completion_rate AS "completionRate",
+                    urm.completed,
+                    urm.last_watched_at AS "lastWatchedAt"
+             FROM user_reel_metrics urm
+             JOIN reels r ON urm.reel_id = r.id
+             WHERE urm.user_id = $1 AND urm.reel_id = $2`,
+            [userId, reelId]
+        );
+
+        if (result.rows.length === 0) {
+            return res.json({
+                reelId: reelId,
+                watchCount: 0,
+                watchTimeSeconds: 0,
+                totalDurationSeconds: 0,
+                completionRate: 0,
+                completed: false,
+                lastWatchedAt: null
+            });
+        }
+
+        const m = result.rows[0];
+        res.json({
+            ...m,
+            watchTimeSeconds: parseFloat(m.watchTimeSeconds),
+            totalDurationSeconds: parseFloat(m.totalDurationSeconds),
+            completionRate: parseFloat(m.completionRate)
+        });
+    } catch (err) {
+        console.error("Error fetching specific watch metric:", err);
+        res.status(500).json({ error: "Server error fetching watch metric" });
     }
 });
 

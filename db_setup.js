@@ -33,6 +33,8 @@ async function run() {
         // Ensure legacy reels columns exist
         await pool.query("ALTER TABLE reels ADD COLUMN IF NOT EXISTS file_data BYTEA");
         await pool.query("ALTER TABLE reels ADD COLUMN IF NOT EXISTS filename TEXT");
+        await pool.query("ALTER TABLE reels ADD COLUMN IF NOT EXISTS category VARCHAR(255) DEFAULT 'General'");
+        await pool.query("ALTER TABLE reels ADD COLUMN IF NOT EXISTS duration_seconds NUMERIC(10, 2) DEFAULT 0");
 
         // Ensure user profile columns exist
         await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS phone VARCHAR(50)");
@@ -110,7 +112,62 @@ async function run() {
             );
         `);
 
-        // 7. Indexes
+        // 7. User Quiz Attempts Table
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS user_quiz_attempts (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                quiz_id INTEGER NOT NULL REFERENCES quizzes(id) ON DELETE CASCADE,
+                score INTEGER NOT NULL,
+                total_questions INTEGER NOT NULL,
+                percentage NUMERIC(5, 2) NOT NULL,
+                completed_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            );
+        `);
+
+        // 8. User Quiz Answers Table
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS user_quiz_answers (
+                id SERIAL PRIMARY KEY,
+                attempt_id INTEGER NOT NULL REFERENCES user_quiz_attempts(id) ON DELETE CASCADE,
+                question_id INTEGER NOT NULL REFERENCES quiz_questions(id) ON DELETE CASCADE,
+                selected_option_id INTEGER REFERENCES quiz_options(id) ON DELETE SET NULL,
+                is_correct BOOLEAN NOT NULL
+            );
+        `);
+
+        // 9. Summaries Table (AI Document & Reel Summaries)
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS summaries (
+                id SERIAL PRIMARY KEY,
+                reel_id INTEGER REFERENCES reels(id) ON DELETE CASCADE,
+                note_id INTEGER REFERENCES notes(id) ON DELETE CASCADE,
+                title TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                bullets JSONB DEFAULT '[]'::jsonb,
+                source_chunks JSONB DEFAULT '[]'::jsonb,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            );
+        `);
+
+        // 10. User Reel Metrics Table (Watch counts, duration, completion rate)
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS user_reel_metrics (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                reel_id INTEGER NOT NULL REFERENCES reels(id) ON DELETE CASCADE,
+                watch_count INTEGER NOT NULL DEFAULT 1,
+                watch_time_seconds NUMERIC(10, 2) NOT NULL DEFAULT 0,
+                total_duration_seconds NUMERIC(10, 2) NOT NULL DEFAULT 0,
+                completion_rate NUMERIC(5, 2) NOT NULL DEFAULT 0,
+                completed BOOLEAN NOT NULL DEFAULT FALSE,
+                last_watched_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                CONSTRAINT unique_user_reel UNIQUE (user_id, reel_id)
+            );
+        `);
+
+        // 11. Indexes
         await pool.query("CREATE INDEX IF NOT EXISTS idx_quizzes_reel_id ON quizzes(reel_id)");
         await pool.query("CREATE INDEX IF NOT EXISTS idx_quiz_questions_quiz_id ON quiz_questions(quiz_id)");
         await pool.query("CREATE INDEX IF NOT EXISTS idx_quiz_options_question_id ON quiz_options(question_id)");
@@ -120,6 +177,13 @@ async function run() {
         await pool.query("CREATE INDEX IF NOT EXISTS idx_reel_saves_reel_id ON reel_saves(reel_id)");
         await pool.query("CREATE INDEX IF NOT EXISTS idx_users_google_id ON users(google_id)");
         await pool.query("CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)");
+        await pool.query("CREATE INDEX IF NOT EXISTS idx_user_quiz_attempts_user_id ON user_quiz_attempts(user_id)");
+        await pool.query("CREATE INDEX IF NOT EXISTS idx_user_quiz_attempts_quiz_id ON user_quiz_attempts(quiz_id)");
+        await pool.query("CREATE INDEX IF NOT EXISTS idx_user_quiz_answers_attempt_id ON user_quiz_answers(attempt_id)");
+        await pool.query("CREATE INDEX IF NOT EXISTS idx_summaries_reel_id ON summaries(reel_id)");
+        await pool.query("CREATE INDEX IF NOT EXISTS idx_summaries_note_id ON summaries(note_id)");
+        await pool.query("CREATE INDEX IF NOT EXISTS idx_user_reel_metrics_user_id ON user_reel_metrics(user_id)");
+        await pool.query("CREATE INDEX IF NOT EXISTS idx_user_reel_metrics_reel_id ON user_reel_metrics(reel_id)");
 
         console.log("Success! EduReel database schema setup completed successfully.");
     } catch (err) {
